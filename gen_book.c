@@ -2,13 +2,19 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <pthread.h> // POSIX Threads
 
+// --- CONFIGURATION ---
 #define P_WIDTH 7
 #define P_HEIGHT 6
-#define TT_SIZE 8388593 
-// SEARCH DEPTH: Higher = Smarter but Slower. 
-// 12 is a good balance for generating a book quickly.
-#define MAX_SEARCH_DEPTH 12 
+
+// Large Transposition Table (~1GB RAM recommended for God Mode)
+// If this crashes your PC, change it back to 8388593 (~128MB)
+#define TT_SIZE 67108859 
+
+// Depth of the book itself (How many moves from start to memorize)
+// 8 plies = 4 full turns. 
+#define BOOK_GEN_DEPTH 8
 
 typedef uint64_t bitboard_t;
 
@@ -20,11 +26,15 @@ typedef struct {
 
 typedef struct {
     uint64_t key;
-    uint8_t val; 
+    int8_t val; // Store exact score (-21 to +21)
+    uint8_t flag; // 0=Empty, 1=Exact, 2=Lower, 3=Upper
 } TTEntry;
 
-static TTEntry* transTable = NULL;
-static int columnOrder[P_WIDTH];
+// Shared Global Resources
+TTEntry* transTable = NULL;
+int columnOrder[P_WIDTH];
+uint8_t* visitedMap = NULL;
+pthread_mutex_t writeLock; // For writing results safely
 
 // --- BITBOARD LOGIC ---
 static int popcount(bitboard_t m) { return __builtin_popcountll(m); }
@@ -85,26 +95,16 @@ static int pos_move_score(const Position *p, bitboard_t move) {
     return popcount(compute_winning_position(p->current_position | move, p->mask));
 }
 
-// --- DEPTH-LIMITED SOLVER ---
-static void tt_put(uint64_t key, uint8_t val) {
+// --- SOLVER (GOD MODE) ---
+static void tt_put(uint64_t key, int8_t val, uint8_t flag) {
     int idx = key % TT_SIZE;
+    // Always overwrite (Simple strategy for generation)
     transTable[idx].key = key;
     transTable[idx].val = val;
-}
-static uint8_t tt_get(uint64_t key) {
-    int idx = key % TT_SIZE;
-    if(transTable[idx].key == key) return transTable[idx].val;
-    return 0;
+    transTable[idx].flag = flag;
 }
 
-// Simple Heuristic: Score based on central pieces + potential wins
-int heuristic(const Position *P) {
-    return 0; // Placeholder: Assume Draw if depth reached (Safe play)
-}
-
-static int negamax(const Position *P, int alpha, int beta, int depth_left) {
-    if (depth_left <= 0) return heuristic(P); // STOP condition
-
+static int negamax(const Position *P, int alpha, int beta) {
     bitboard_t possible = pos_possible_non_losing_moves(P);
     if (possible == 0) return -(P_WIDTH * P_HEIGHT - P->moves) / 2; 
     if (P->moves >= P_WIDTH * P_HEIGHT - 2) return 0; 
@@ -115,60 +115,107 @@ static int negamax(const Position *P, int alpha, int beta, int depth_left) {
     if (beta > max) { beta = max; if (alpha >= beta) return beta; }
 
     uint64_t key = pos_key(P);
-    uint8_t val = tt_get(key);
-    // Only use TT if stored depth is high enough? For generation, trust it.
-    if (val && val > 200) { 
-        // Simplified TT check
+    int idx = key % TT_SIZE;
+    
+    // TT Lookup
+    if (transTable[idx].key == key) {
+        if (transTable[idx].flag == 1) return transTable[idx].val;
+        if (transTable[idx].flag == 2 && transTable[idx].val >= beta) return transTable[idx].val;
+        if (transTable[idx].flag == 3 && transTable[idx].val <= alpha) return transTable[idx].val;
     }
+
+    // Move Sorter (Crucial for God Mode performance)
+    struct { int move; int score; } moves[P_WIDTH];
+    int count = 0;
 
     for (int i = P_WIDTH - 1; i >= 0; i--) {
         int col = columnOrder[i];
         bitboard_t move = possible & column_mask(col);
         if (move) {
-            Position P2 = *P;
-            pos_play(&P2, move);
-            int score = -negamax(&P2, -beta, -alpha, depth_left - 1);
-            if (score >= beta) return score;
-            if (score > alpha) alpha = score;
+            moves[count].move = col;
+            moves[count].score = pos_move_score(P, move); // Simple heuristic for sorting
+            count++;
         }
     }
+
+    // Sort Moves (Bubble sort is fast enough for 7 items)
+    for(int i=0; i<count; i++) {
+        for(int j=i+1; j<count; j++) {
+            if(moves[j].score > moves[i].score) {
+                int tm = moves[i].move; int ts = moves[i].score;
+                moves[i].move = moves[j].move; moves[i].score = moves[j].score;
+                moves[j].move = tm; moves[j].score = ts;
+            }
+        }
+    }
+
+    int bestScore = -100; // Init with something lower than min possible
+
+    for(int i=0; i<count; i++) {
+        int col = moves[i].move;
+        bitboard_t move = possible & column_mask(col);
+        
+        Position P2 = *P;
+        pos_play(&P2, move);
+        
+        int score = -negamax(&P2, -beta, -alpha);
+        
+        if(score > bestScore) bestScore = score;
+        
+        if (score >= beta) {
+            tt_put(key, score, 2); // Lower bound
+            return score;
+        }
+        if (score > alpha) alpha = score;
+    }
+    
+    // If we didn't prune, we found an exact or upper bound
+    if(bestScore <= alpha) tt_put(key, bestScore, 3); // Upper
+    else tt_put(key, bestScore, 1); // Exact
+    
     return alpha;
 }
 
 static int solve(const Position *P) {
     if (pos_can_win_next(P)) return (P_WIDTH * P_HEIGHT + 1 - P->moves) / 2;
-    int min = -100; // We limit score range because we aren't solving perfect endgames
-    int max = 100;
-    
-    // Search fixed depth
-    int r = negamax(P, min, max, MAX_SEARCH_DEPTH);
-    return r;
+    return negamax(P, -100, 100); // Full Window search
 }
 
 // --- GENERATOR ---
-uint8_t* visitedMap; 
 void mark_visited(uint64_t key) { visitedMap[key % TT_SIZE] = 1; }
 int is_visited(uint64_t key) { return visitedMap[key % TT_SIZE]; }
 
-void generate_book(Position p, int depth, int max_gen_depth) {
-    if (depth > max_gen_depth) return;
+typedef struct { uint64_t key; int move; } Result;
+Result results[1000000];
+int res_count = 0;
 
-    // Progress for the user (printed to stderr so it shows on screen)
-    if (depth < 2) {
-        fprintf(stderr, "Generating Depth %d...\n", depth);
+void add_result(uint64_t k, int m) {
+    pthread_mutex_lock(&writeLock);
+    if (!is_visited(k)) {
+        results[res_count].key = k;
+        results[res_count].move = m;
+        res_count++;
+        mark_visited(k);
     }
+    pthread_mutex_unlock(&writeLock);
+}
+
+void generate_book_recursive(Position p, int depth) {
+    if (depth > BOOK_GEN_DEPTH) return;
 
     int bestCol = -1;
     int bestScore = -9999;
 
-    // Find best move for this node
+    // 1. Solve this position perfectly
     for(int i = 0; i < P_WIDTH; i++) {
         int col = columnOrder[i]; 
         if((p.mask & (1ULL << ((P_HEIGHT - 1) + col * (P_HEIGHT + 1)))) == 0) {
             Position p2 = p;
             bitboard_t move = (p2.mask + bottom_mask_col(col)) & column_mask(col);
             pos_play(&p2, move); 
+            
             int score = -solve(&p2);
+            
             if(score > bestScore) {
                 bestScore = score;
                 bestCol = col;
@@ -177,42 +224,98 @@ void generate_book(Position p, int depth, int max_gen_depth) {
     }
 
     if (bestCol != -1) {
-        uint64_t k = pos_key(&p);
-        if (!is_visited(k)) {
-            printf("add_to_book(%lluULL, %d);\n", k, bestCol + 1);
-            fflush(stdout); // FORCE PRINT TO FILE
-            mark_visited(k);
-        }
+        add_result(pos_key(&p), bestCol + 1);
     }
 
-    // Recurse
+    // 2. Expand Tree if game not over
+    // Optimization: If we found a forced win, maybe we don't need to memorize deeper?
+    // For book generation, we usually want to be robust, so we continue.
+    if (bestScore > 20 || bestScore < -20) return; // End of game reached
+
     for (int c = 0; c < P_WIDTH; c++) {
         if ((p.mask & (1ULL << ((P_HEIGHT - 1) + c * (P_HEIGHT + 1)))) == 0) {
              Position next = p;
              bitboard_t move = (next.mask + bottom_mask_col(c)) & column_mask(c);
              pos_play(&next, move);
-             generate_book(next, depth + 1, max_gen_depth);
+             generate_book_recursive(next, depth + 1);
         }
     }
 }
 
+// --- THREAD WORKER ---
+struct ThreadArgs {
+    Position startP;
+    int col;
+};
+
+void* worker_thread(void* arg) {
+    struct ThreadArgs* args = (struct ThreadArgs*)arg;
+    Position p = args->startP;
+    int col = args->col;
+    
+    fprintf(stderr, "Thread solving Col %d branch...\n", col+1);
+    
+    bitboard_t move = (p.mask + bottom_mask_col(col)) & column_mask(col);
+    pos_play(&p, move);
+    
+    // Start recursing
+    generate_book_recursive(p, 2);
+    
+    fprintf(stderr, "Thread finished Col %d.\n", col+1);
+    return NULL;
+}
+
 int main() {
+    pthread_mutex_init(&writeLock, NULL);
+    
+    // Allocate huge tables
+    fprintf(stderr, "Allocating %.2f MB for Transposition Table...\n", (double)(TT_SIZE * sizeof(TTEntry))/(1024*1024));
     transTable = (TTEntry*)calloc(TT_SIZE, sizeof(TTEntry));
     visitedMap = (uint8_t*)calloc(TT_SIZE, sizeof(uint8_t));
+    
+    if(!transTable || !visitedMap) {
+        fprintf(stderr, "Memory allocation failed! Try reducing TT_SIZE.\n");
+        return 1;
+    }
+
     for(int i = 0; i < P_WIDTH; i++) columnOrder[i] = P_WIDTH/2 + (1-2*(i%2))*(i+1)/2;
 
-    printf("// Generated Book (Depth 12 analysis)\n");
+    printf("// Generated Book (God Mode - Full Solve)\n");
     printf("void init_book() {\n");
-    
+    printf("add_to_book(0ULL, 4);\n"); 
+
+    // Root: P1 played Col 4
     Position root = {0, 0, 0};
-    // Generate book for the first 6 moves of the game
-    generate_book(root, 0, 6);
-    
+    bitboard_t m = (root.mask + bottom_mask_col(3)) & column_mask(3);
+    pos_play(&root, m);
+
+    // Launch Threads
+    pthread_t threads[P_WIDTH];
+    struct ThreadArgs args[P_WIDTH];
+    int valid_threads = 0;
+
+    for (int c = 0; c < P_WIDTH; c++) {
+        int col = columnOrder[c];
+        if ((root.mask & (1ULL << ((P_HEIGHT - 1) + col * (P_HEIGHT + 1)))) == 0) {
+            args[valid_threads].startP = root;
+            args[valid_threads].col = col;
+            pthread_create(&threads[valid_threads], NULL, worker_thread, &args[valid_threads]);
+            valid_threads++;
+        }
+    }
+
+    for(int i=0; i<valid_threads; i++) pthread_join(threads[i], NULL);
+
+    // Print Results
+    for(int i=0; i<res_count; i++) {
+        printf("add_to_book(%lluULL, %d);\n", results[i].key, results[i].move);
+    }
     printf("}\n");
     
-    fprintf(stderr, "Done! Check book_data.c\n");
+    fprintf(stderr, "Done! Generated %d moves.\n", res_count);
 
     free(transTable);
     free(visitedMap);
+    pthread_mutex_destroy(&writeLock);
     return 0;
 }
